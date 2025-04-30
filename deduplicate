@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+
+import os
+import hashlib
+import sys
+
+def file_hash(path, chunk_size=8192):
+    hasher = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while chunk := f.read(chunk_size):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def deduplicate(directory):
+    hash_to_path = {}
+    for root, _, files in os.walk(directory):
+        for name in files:
+            full_path = os.path.join(root, name)
+            if os.path.islink(full_path):
+                continue
+
+            try:
+                h = file_hash(full_path)
+            except Exception as e:
+                print(f"Skipping {full_path}: {e}")
+                continue
+
+            if h in hash_to_path:
+                original = hash_to_path[h]
+                os.remove(full_path)
+                os.symlink(os.path.relpath(original, start=os.path.dirname(full_path)), full_path)
+                print(f"Replaced duplicate {full_path} with symlink to {original}")
+            else:
+                hash_to_path[h] = full_path
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: deduplicate /path/to/directory")
+        sys.exit(1)
+    deduplicate(sys.argv[1])

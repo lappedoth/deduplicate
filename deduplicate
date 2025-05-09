@@ -11,8 +11,11 @@ def file_hash(path, chunk_size=8192):
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def deduplicate(directory):
+def deduplicate_preview(directory):
     hash_to_path = {}
+    total_saving = 0
+    duplicates = []
+
     for root, _, files in os.walk(directory):
         for name in files:
             full_path = os.path.join(root, name)
@@ -21,20 +24,50 @@ def deduplicate(directory):
 
             try:
                 h = file_hash(full_path)
+                size = os.path.getsize(full_path)
             except Exception as e:
                 print(f"Skipping {full_path}: {e}")
                 continue
 
             if h in hash_to_path:
-                original = hash_to_path[h]
-                os.remove(full_path)
-                os.symlink(os.path.relpath(original, start=os.path.dirname(full_path)), full_path)
-                print(f"Replaced duplicate {full_path} with symlink to {original}")
+                total_saving += size
+                duplicates.append((full_path, hash_to_path[h]))
             else:
                 hash_to_path[h] = full_path
+
+    return total_saving, duplicates
+
+def apply_deduplication(duplicates):
+    for duplicate, original in duplicates:
+        os.remove(duplicate)
+        os.link(original, duplicate)
+        print(f"Replaced {duplicate} with hard link to {original}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: deduplicate /path/to/directory")
         sys.exit(1)
-    deduplicate(sys.argv[1])
+
+    directory = sys.argv[1]
+    total_saving, duplicates = deduplicate_preview(directory)
+
+    print(f"\nIdentified {len(duplicates)} duplicate files.")
+    print(f"Estimated disk space saving: {total_saving / (1024 * 1024):.2f} MB\n")
+
+    show_examples = input("Do you want to see examples of duplicates? [y/N]: ").strip().lower()
+    if show_examples == 'y':
+        try:
+            num = int(input(f"How many examples would you like to see? (1–{len(duplicates)}): ").strip())
+        except ValueError:
+            num = 5
+        print("\nExample duplicate file pairs:\n")
+        for i, (dup, orig) in enumerate(duplicates[:max(0, min(num, len(duplicates)))]):
+            print(f"Original: {orig}")
+            print(f"Duplicate: {dup}\n")
+
+    confirm = input("Do you want to proceed with replacing duplicates with hard links? [y/N]: ").strip().lower()
+    if confirm == 'y':
+        apply_deduplication(duplicates)
+        print("Deduplication complete.")
+    else:
+        print("Operation cancelled.")

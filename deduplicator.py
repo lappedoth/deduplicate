@@ -1,179 +1,251 @@
-#!/usr/bin/env python3
 
-import os
+#!/usr/bin/env python3
+"""deduplicator.py
+
+A small utility to find duplicate files within a directory tree and replace
+them with either hard links or symbolic links to a single canonical copy.
+It can also undo the process ("reduplicate"), restoring real file copies
+in place of links.
+
+Usage
+-----
+
+# Preview duplicates, then deduplicate (default = hard links)
+$ deduplicator.py deduplicate /path/to/data
+
+# Explicitly choose link type
+$ deduplicator.py deduplicate -l /path/to/data   # hard‑links
+$ deduplicator.py deduplicate -s /path/to/data   # symlinks
+
+# Restore files (remove links, re‑copy real data)
+$ deduplicator.py reduplicate /path/to/data
+"""
+
+from __future__ import annotations
+
 import hashlib
-import sys
+import os
 import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-def file_hash(path, chunk_size=8192):
+################################################################################
+# Helpers
+################################################################################
+
+
+def file_hash(path: Path, chunk_size: int = 8192) -> str:
+    """Return SHA‑256 hex digest of *path*."""
     hasher = hashlib.sha256()
-    with open(path, 'rb') as f:
+    with path.open("rb") as f:
         while chunk := f.read(chunk_size):
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def deduplicate_preview(directory):
-    hash_to_path = {}
+
+################################################################################
+# Deduplication
+################################################################################
+
+
+def deduplicate_preview(directory: Path) -> Tuple[int, List[Tuple[Path, Path]]]:
+    """Traverse *directory* and collect duplicates.
+
+    Returns
+    -------
+    total_saving : int
+        Total number of bytes that *could* be saved.
+    duplicates : list[tuple[Path, Path]]
+        A list of (duplicate, original) pairs.
+    """
+    hash_to_path: Dict[str, Path] = {}
     total_saving = 0
-    duplicates = []
+    duplicates: List[Tuple[Path, Path]] = []
 
     for root, _, files in os.walk(directory):
         for name in files:
-            full_path = os.path.join(root, name)
-            if os.path.islink(full_path):
+            full_path = Path(root) / name
+
+            # Ignore symlinks
+            if full_path.is_symlink():
                 continue
+
             try:
-                h = file_hash(full_path)
-                size = os.path.getsize(full_path)
-            except Exception as e:
-                print(f"Skipping {full_path}: {e}")
+                digest = file_hash(full_path)
+                size = full_path.stat().st_size
+            except (OSError, PermissionError) as exc:
+                print(f"[skip] {full_path}: {exc}")
                 continue
-            if h in hash_to_path:
+
+            if digest in hash_to_path:
                 total_saving += size
-                duplicates.append((full_path, hash_to_path[h]))
+                duplicates.append((full_path, hash_to_path[digest]))
             else:
-                hash_to_path[h] = full_path
+                hash_to_path[digest] = full_path
+
     return total_saving, duplicates
 
-def create_alias(target, alias_path):
-    try:
-        subprocess.run([
-            "osascript", "-e",
-            f'tell application "Finder" to make alias file to (POSIX file "{os.path.abspath(target)}") at (POSIX file "{os.path.dirname(os.path.abspath(alias_path))}")'
-        ], check=True)
-        os.rename(os.path.join(os.path.dirname(alias_path), os.path.basename(target) + " alias"), alias_path)
-    except subprocess.CalledProcessError:
-        print(f"Failed to create alias for {target} at {alias_path}")
 
-def deduplicate_file(pair, mode):
+def _link_or_symlink(duplicate: Path, original: Path, mode: str) -> None:
+    """Replace *duplicate* with hard‑link or symlink to *original*."""
+    # Remove the duplicate file first
+    duplicate.unlink()
+
+    if mode == "hard":
+        os.link(original, duplicate)
+    elif mode == "symlink":
+        rel_target = os.path.relpath(original, start=duplicate.parent)
+        duplicate.symlink_to(rel_target)
+    else:  # pragma: no cover
+        raise ValueError(f"Unknown mode {mode!r}")
+
+
+def deduplicate_file(pair: Tuple[Path, Path], mode: str) -> str | None:
+    """Worker helper for ThreadPoolExecutor."""
     duplicate, original = pair
     try:
-        os.remove(duplicate)
-        if mode == "hard":
-            os.link(original, duplicate)
-            return f"Hard-linked {duplicate} → {original}"
-        elif mode == "symlink":
-            rel = os.path.relpath(original, start=os.path.dirname(duplicate))
-            os.symlink(rel, duplicate)
-            return f"Symlinked {duplicate} → {rel}"
-        elif mode == "alias":
-            create_alias(original, duplicate)
-            return f"Alias created for {duplicate} → {original}"
-    except Exception as e:
-        return f"Failed to deduplicate {duplicate}: {e}"
+        _link_or_symlink(duplicate, original, mode)
+        link_desc = "hard‑linked" if mode == "hard" else "symlinked"
+        return f"{link_desc} {duplicate} → {original}"
+    except Exception as exc:
+        return f"[error] {duplicate}: {exc}"
 
-def apply_deduplication(duplicates, mode):
-    max_workers = max(1, (os.cpu_count() or 4) - 1)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(deduplicate_file, pair, mode) for pair in duplicates]
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                print(result)
 
-def is_mac_alias(path):
+def apply_deduplication(duplicates: List[Tuple[Path, Path]], mode: str) -> None:
+    """Parallel replacement of duplicates with links."""
+    workers = max(1, (os.cpu_count() or 4) - 1)
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futures = [exe.submit(deduplicate_file, pair, mode) for pair in duplicates]
+        for fut in as_completed(futures):
+            msg = fut.result()
+            if msg:
+                print(msg)
+
+
+################################################################################
+# Reduplication (undo)
+################################################################################
+
+
+def reduplicate_file(path: Path) -> str | None:
+    """Restore a real file where *path* is a symlink or inode‑shared file."""
     try:
-        result = subprocess.run([
-            'osascript', '-e',
-            f'tell application "Finder" to get original item of alias file (POSIX file "{os.path.abspath(path)}")'
-        ], capture_output=True, text=True)
-        return result.returncode == 0
-    except Exception:
-        return False
+        if path.is_symlink():
+            target = path.resolve()
+            # Replace symlink with a real copy
+            path.unlink()
+            shutil.copy2(target, path)
+            return f"restored copy from symlink: {path}"
 
-def resolve_mac_alias(path):
-    result = subprocess.run([
-        'osascript', '-e',
-        f'tell application "Finder" to POSIX path of (original item of alias file (POSIX file "{os.path.abspath(path)}"))'
-    ], capture_output=True, text=True)
-    if result.returncode == 0:
-        return result.stdout.strip()
-    else:
-        return None
+        # Hard‑link detection: link count > 1
+        if path.stat().st_nlink > 1:
+            tmp = path.with_suffix(path.suffix + ".redup_tmp")
+            shutil.copy2(path, tmp)  # copy contents (creates new inode)
+            tmp.replace(path)        # atomically replace
+            return f"unlinked hard‑link: {path}"
 
-def reduplicate_file(full_path):
-    try:
-        if os.path.islink(full_path):
-            target = os.readlink(full_path)
-            abs_target = os.path.abspath(os.path.join(os.path.dirname(full_path), target))
-            os.remove(full_path)
-            shutil.copy2(abs_target, full_path)
-            return f"Restored real file from symlink: {full_path}"
-        elif os.stat(full_path).st_nlink > 1:
-            tmp_path = full_path + ".redup_tmp"
-            shutil.copy2(full_path, tmp_path)
-            os.replace(tmp_path, full_path)
-            return f"Unlinked hard link: {full_path}"
-        elif is_mac_alias(full_path):
-            resolved = resolve_mac_alias(full_path)
-            if resolved and os.path.exists(resolved):
-                os.remove(full_path)
-                shutil.copy2(resolved, full_path)
-                return f"Restored real file from alias: {full_path}"
-    except Exception as e:
-        return f"Failed to reduplicate {full_path}: {e}"
+    except Exception as exc:
+        return f"[error] {path}: {exc}"
+
     return None
 
-def reduplicate(directory):
-    max_workers = max(1, (os.cpu_count() or 4) - 1)
-    tasks = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+def reduplicate(directory: Path) -> None:
+    workers = max(1, (os.cpu_count() or 4) - 1)
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futures = []
         for root, _, files in os.walk(directory):
             for name in files:
-                full_path = os.path.join(root, name)
-                tasks.append(executor.submit(reduplicate_file, full_path))
-        for future in as_completed(tasks):
-            result = future.result()
-            if result:
-                print(result)
+                futures.append(exe.submit(reduplicate_file, Path(root) / name))
+        for fut in as_completed(futures):
+            msg = fut.result()
+            if msg:
+                print(msg)
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in ("deduplicate", "reduplicate"):
-        print("Usage:\n  deduplicator.py deduplicate [-l|-s|-a] /path\n  deduplicator.py reduplicate /path")
+
+################################################################################
+# CLI
+################################################################################
+
+
+def _print_usage() -> None:
+    print(
+        """Usage:
+  deduplicator.py deduplicate [-l|-s] /path
+      -l   create hard links (default)
+      -s   create symbolic links
+
+  deduplicator.py reduplicate /path
+        """
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+
+    if not argv or argv[0] not in {"deduplicate", "reduplicate"}:
+        _print_usage()
         sys.exit(1)
 
-    action = sys.argv[1]
+    action = argv[0]
 
     if action == "deduplicate":
-        mode = "hard"
-        if len(sys.argv) == 4 and sys.argv[2] in ("-l", "-s", "-a"):
-            mode_flag = sys.argv[2]
-            mode = {"-l": "hard", "-s": "symlink", "-a": "alias"}[mode_flag]
-            directory = sys.argv[3]
-        elif len(sys.argv) == 3:
-            directory = sys.argv[2]
-        else:
-            print("Usage: deduplicator.py deduplicate [-l|-s|-a] /path")
+        # Defaults
+        mode = "hard"   # hard‑link
+        directory_arg_index = 1
+
+        if len(argv) >= 2 and argv[1] in {"-l", "-s"}:
+            flag = argv[1]
+            mode = "hard" if flag == "-l" else "symlink"
+            directory_arg_index = 2
+
+        if len(argv) <= directory_arg_index:
+            _print_usage()
             sys.exit(1)
 
-        total_saving, duplicates = deduplicate_preview(directory)
-        print(f"\nIdentified {len(duplicates)} duplicate files.")
-        print(f"Estimated disk space saving: {total_saving / (1024 * 1024):.2f} MB\n")
+        directory = Path(argv[directory_arg_index]).expanduser().resolve()
 
-        show_examples = input("Do you want to see examples of duplicates? [y/N]: ").strip().lower()
-        if show_examples == 'y':
-            try:
-                num = int(input(f"How many examples? (1–{len(duplicates)}): ").strip())
-            except ValueError:
-                num = 5
-            print("\nExample duplicates:\n")
-            for dup, orig in duplicates[:max(0, min(num, len(duplicates)))]:
-                print(f"Original:  {orig}")
-                print(f"Duplicate: {dup}\n")
+        if not directory.is_dir():
+            print(f"[error] {directory} is not a directory")
+            sys.exit(1)
+
+        print(f"Scanning {directory} …\n")
+        saving, dups = deduplicate_preview(directory)
+        print(f"Found {len(dups)} duplicate files.")
+        print(f"Potential space saving: {saving / (1024 ** 2):.2f} MB\n")
+
+        # Show a few examples
+        if dups:
+            ans = input("Show a few duplicates? [y/N]: ").strip().lower()
+            if ans == "y":
+                n = min(5, len(dups))
+                print("\nExamples:\n")
+                for dup, orig in dups[:n]:
+                    print(f"   duplicate: {dup}\n   original : {orig}\n")
 
         confirm = input(f"Proceed with deduplication using {mode} links? [y/N]: ").strip().lower()
-        if confirm == 'y':
-            apply_deduplication(duplicates, mode)
-            print("Deduplication complete.")
+        if confirm == "y":
+            apply_deduplication(dups, mode)
+            print("\nDeduplication complete.")
         else:
-            print("Operation cancelled.")
+            print("Aborted.")
 
     elif action == "reduplicate":
-        if len(sys.argv) != 3:
-            print("Usage: deduplicator.py reduplicate /path")
+        if len(argv) != 2:
+            _print_usage()
             sys.exit(1)
-        directory = sys.argv[2]
+
+        directory = Path(argv[1]).expanduser().resolve()
+        if not directory.is_dir():
+            print(f"[error] {directory} is not a directory")
+            sys.exit(1)
+
         reduplicate(directory)
-        print("Reduplication complete.")
+        print("\nReduplication complete.")
+
+
+if __name__ == "__main__":
+    main()
